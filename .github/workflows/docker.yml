@@ -1,0 +1,223 @@
+name: build image
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  TEST_IMAGE: crossfire-archive:smoke
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=tag
+            type=ref,event=pr
+            type=sha,format=short
+
+      # Single-arch build we can actually load and run.
+      - name: Build for testing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.TEST_IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ------------------------------------------------------------------
+      # The real archive is 16.4 GiB, so CI exercises the entrypoint against a
+      # ~2 KB stand-in built in the same layout. This covers extraction, the
+      # checksum path, the <id>.html aliasing, the rewrite rules and the
+      # config swap + reload.
+      # ------------------------------------------------------------------
+      - name: Build a stand-in archive
+        run: |
+          set -euo pipefail
+          command -v 7z >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full; }
+
+          mkdir -p fixture/raw/news fixture/raw/articles fixture/raw/forums
+          # Marker strings are deliberately non-overlapping: a substring match
+          # must not be able to pass by accident (e.g. an alias pointing at the
+          # pagination file instead of the article).
+          echo 'MARK-INDEX'          > fixture/raw/index.html
+          echo 'MARK-NOTFOUND'       > fixture/raw/404.html
+          echo 'MARK-NEWS-ONE'       > fixture/raw/news/1.night-enemy-territory.html
+          echo 'MARK-ARTICLE-FIVE'   > fixture/raw/articles/5.eurocup-playoffs.html
+          echo 'MARK-ARTICLE-P2'     > fixture/raw/articles/5.page.2.html
+          echo 'MARK-FORUM-P1'       > fixture/raw/forums/view.id.9.page.1.html
+          echo 'MARK-FORUM-P2'       > fixture/raw/forums/view.id.9.page.2.html
+
+          ( cd fixture && 7z a -bso0 ../mini.7z raw >/dev/null )
+          echo "MINI_SHA=$(sha256sum mini.7z | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "FIXTURE_DIR=$PWD" >> "$GITHUB_ENV"
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+
+          echo "fixture: $FIXTURE_DIR/mini.7z"
+          ls -l "$FIXTURE_DIR/mini.7z"
+          echo "expected sha256: $MINI_SHA"
+
+          docker run -d --name smoke -p 18080:80 \
+            -v "$FIXTURE_DIR/mini.7z:/archive.7z:ro" \
+            -e ARCHIVE_FILE=/archive.7z \
+            -e ARCHIVE_SHA256="$MINI_SHA" \
+            -e SKIP_DISK_CHECK=1 \
+            "$TEST_IMAGE"
+
+          # `docker inspect -f '{{.State.Health.Status}}'` exits 1 when the
+          # Health key isn't populated yet, which under `set -e` would kill the
+          # step; and .State.Running is false while a container is still in
+          # `created`, which reads as "exited" if you check it too early. Ask
+          # for .State.Status instead and always provide a fallback.
+          cstatus() { docker inspect -f '{{.State.Status}}' smoke 2>/dev/null || echo unknown; }
+          chealth() { docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' smoke 2>/dev/null || echo unknown; }
+
+          bail() {
+            echo "::error::$1"
+            echo "--- status ---"
+            docker inspect -f 'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' smoke 2>&1 || true
+            echo "--- container logs ---"
+            docker logs smoke 2>&1 || true
+            echo "--- healthcheck output ---"
+            docker inspect -f '{{range .State.Health.Log}}{{.Output}}{{end}}' smoke 2>&1 || true
+            exit 1
+          }
+
+          echo "waiting for healthy..."
+          for _ in $(seq 1 90); do
+            h=$(chealth); s=$(cstatus)
+            [ "$h" = "healthy" ] && break
+            case "$s" in
+              exited|dead) bail "container stopped before becoming healthy (status=$s)" ;;
+              unknown)     bail "container disappeared" ;;
+            esac
+            sleep 2
+          done
+          [ "$(chealth)" = "healthy" ] || bail "never became healthy (status=$(cstatus) health=$(chealth))"
+          echo "healthy after $(docker inspect -f '{{.State.StartedAt}}' smoke)"
+
+          check() { # check <path> <expected-status> <expected-substring>
+            code=$(curl -s -o /tmp/body -w '%{http_code}' "http://127.0.0.1:18080$1")
+            if [ "$code" != "$2" ]; then
+              echo "FAIL $1 -> $code (want $2)"; cat /tmp/body; return 1
+            fi
+            if ! grep -q "$3" /tmp/body; then
+              echo "FAIL $1 -> body missing '$3'"; cat /tmp/body; return 1
+            fi
+            echo "ok   $1 -> $code"
+          }
+
+          check /                             200 MARK-INDEX
+          # DEVIATION A: these only resolve because the entrypoint aliased
+          # <id>.html -> <id>.<slug>.html after extraction.
+          check /news/view/id/1               200 MARK-NEWS-ONE
+          check /articles/view/id/5           200 MARK-ARTICLE-FIVE
+          # The alias must point at the article, never at its pagination file.
+          check /articles/view/id/5/page/2    200 MARK-ARTICLE-P2
+          # Slug-in-URL form, which worked in the original config already.
+          check /news/1/night-enemy-territory 200 MARK-NEWS-ONE
+          # DEVIATION B: with the original rule order this served page one.
+          check /forums/view/id/9/page/2      200 MARK-FORUM-P2
+          check /forums/view/id/9             200 MARK-FORUM-P1
+          check /nonsense-does-not-exist      404 MARK-NOTFOUND
+
+          # A restart must skip straight to serving, not re-extract.
+          #
+          # Note: never pipe `docker logs` into `grep -q` here. grep exits on
+          # the first match and closes the pipe, docker logs takes SIGPIPE, and
+          # under `set -o pipefail` the pipeline reports failure even though the
+          # match succeeded. Capture to a file, then grep the file.
+          docker restart smoke >/dev/null
+          for _ in $(seq 1 30); do
+            docker logs smoke >/tmp/smoke.log 2>&1 || true
+            grep -q 'serving immediately' /tmp/smoke.log && break
+            sleep 1
+          done
+          grep -q 'serving immediately' /tmp/smoke.log \
+            || bail "restart did not use the already-extracted fast path"
+          echo "ok   restart uses the fast path"
+
+      - name: Smoke test — checksum mismatch must fail the container
+        run: |
+          set -euo pipefail
+          docker run -d --name badsum \
+            -v "$FIXTURE_DIR/mini.7z:/archive.7z:ro" \
+            -e ARCHIVE_FILE=/archive.7z \
+            -e ARCHIVE_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
+            -e SKIP_DISK_CHECK=1 \
+            "$TEST_IMAGE"
+
+          # Wait for `exited` specifically: a container still in `created`
+          # reports Running=false, which would look like an instant exit.
+          for _ in $(seq 1 60); do
+            s=$(docker inspect -f '{{.State.Status}}' badsum 2>/dev/null || echo unknown)
+            case "$s" in exited|dead|unknown) break ;; esac
+            sleep 1
+          done
+
+          status=$(docker inspect -f '{{.State.Status}}' badsum 2>/dev/null || echo unknown)
+          code=$(docker inspect -f '{{.State.ExitCode}}' badsum 2>/dev/null || echo -1)
+          if [ "$status" != "exited" ] || [ "$code" = "0" ]; then
+            echo "::error::a bad checksum should exit non-zero (status=$status exit=$code)"
+            docker logs badsum 2>&1 || true; exit 1
+          fi
+          # Capture first, then grep -- see the SIGPIPE/pipefail note above.
+          docker logs badsum >/tmp/badsum.log 2>&1 || true
+          grep -qi 'checksum mismatch' /tmp/badsum.log \
+            || { echo "::error::no checksum mismatch in the logs"; cat /tmp/badsum.log; exit 1; }
+          echo "ok   bad checksum exits $code"
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs smoke || true
+
+      - name: Clean up test containers
+        if: always()
+        run: docker rm -f smoke badsum 2>/dev/null || true
+
+      # Only reached if every check above passed.
+      - name: Build and push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

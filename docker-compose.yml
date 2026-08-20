@@ -1,0 +1,25 @@
+services:
+  crossfire:
+    # Builds from this directory by default so `docker compose up` works out of
+    # the box. To use the published image instead, comment `build` out and
+    # uncomment `image`, it is published on every push to main.
+    build: .
+    # image: ghcr.io/oksii/crossfire-archive:latest
+    container_name: crossfire-archive
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      # A named volume, not a bind mount: unpacking 336k small files through
+      # virtiofs/NFS is dramatically slower.
+      - crossfire-data:/site
+    # environment:
+    #   # Serve from a local copy instead of downloading:
+    #   ARCHIVE_FILE: /archive.7z
+    #   # Point at your own mirror (set ARCHIVE_SHA256 to match, or "" to skip):
+    #   ARCHIVE_URL: https://example.invalid/crossfire-archive.7z
+    # volumes:
+    #   - ./crossfire-archive.7z:/archive.7z:ro
+
+volumes:
+  crossfire-data:

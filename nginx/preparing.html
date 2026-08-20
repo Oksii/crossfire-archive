@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="30">
+<title>Preparing the Crossfire archive</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; min-height: 100vh;
+    display: flex; align-items: center; justify-content: center;
+    background: #14171c; color: #c9d1d9;
+    font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 2rem;
+  }
+  main { max-width: 34rem; }
+  h1 { font-size: 1.4rem; margin: 0 0 .75rem; color: #f0f6fc; font-weight: 600; }
+  p  { margin: 0 0 .75rem; }
+  .muted { color: #8b949e; font-size: .9rem; }
+  code { background: #1f242c; padding: .1rem .35rem; border-radius: 3px; font-size: .85em; }
+  .bar {
+    height: 3px; border-radius: 3px; margin: 1.25rem 0;
+    background: linear-gradient(90deg, #2a3038 25%, #4a90d9 50%, #2a3038 75%)
+                0 0 / 200% 100%;
+    animation: slide 1.6s linear infinite;
+  }
+  @keyframes slide { to { background-position: -200% 0; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Preparing the Crossfire archive&hellip;</h1>
+  <div class="bar"></div>
+  <p>This container is downloading and unpacking the site archive. It only
+     happens once &mdash; after this, restarts serve immediately.</p>
+  <p class="muted">There's about 16.4&nbsp;GiB and 336,000 files to unpack, so
+     expect this to take a few minutes &mdash; longer on slower disks.
+     This page refreshes every 30 seconds. Progress is in
+     <code>docker logs</code>.</p>
+</main>
+</body>
+</html>

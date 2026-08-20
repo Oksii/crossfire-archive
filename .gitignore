@@ -1,0 +1,3 @@
+# The archive itself is never committed: 357 MiB is well past GitHub's 100 MiB
+# hard limit, and it's already hosted at dl.etl.lol.
+*.7z
